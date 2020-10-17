@@ -160,7 +160,7 @@ impl OutputResources {
 // Context is associated with one `DecoderSession`, which corresponds to one stream from the
 // virtio-video's point of view.
 #[derive(Default)]
-struct Context {
+struct Context<S: DecoderSession> {
     stream_id: StreamId,
 
     in_params: Params,
@@ -168,9 +168,11 @@ struct Context {
 
     in_res: InputResources,
     out_res: OutputResources,
+
+    session: Option<S>,
 }
 
-impl Context {
+impl<S: DecoderSession> Context<S> {
     fn new(stream_id: StreamId, format: Format) -> Self {
         Context {
             stream_id,
@@ -182,7 +184,9 @@ impl Context {
                 ..Default::default()
             },
             out_params: Default::default(),
-            ..Default::default()
+            in_res: Default::default(),
+            out_res: Default::default(),
+            session: None,
         }
     }
 
@@ -295,13 +299,18 @@ impl Context {
 }
 
 /// A thin wrapper of a map of contexts with error handlings.
-#[derive(Default)]
-struct ContextMap {
-    map: BTreeMap<StreamId, Context>,
+struct ContextMap<S: DecoderSession> {
+    map: BTreeMap<StreamId, Context<S>>,
 }
 
-impl ContextMap {
-    fn insert(&mut self, ctx: Context) -> VideoResult<()> {
+impl<S: DecoderSession> ContextMap<S> {
+    fn new() -> Self {
+        ContextMap {
+            map: Default::default(),
+        }
+    }
+
+    fn insert(&mut self, ctx: Context<S>) -> VideoResult<()> {
         match self.map.entry(ctx.stream_id) {
             Entry::Vacant(e) => {
                 e.insert(ctx);
@@ -314,14 +323,14 @@ impl ContextMap {
         }
     }
 
-    fn get(&self, stream_id: &StreamId) -> VideoResult<&Context> {
+    fn get(&self, stream_id: &StreamId) -> VideoResult<&Context<S>> {
         self.map.get(stream_id).ok_or_else(|| {
             error!("failed to get context of stream {}", *stream_id);
             VideoError::InvalidStreamId(*stream_id)
         })
     }
 
-    fn get_mut(&mut self, stream_id: &StreamId) -> VideoResult<&mut Context> {
+    fn get_mut(&mut self, stream_id: &StreamId) -> VideoResult<&mut Context<S>> {
         self.map.get_mut(stream_id).ok_or_else(|| {
             error!("failed to get context of stream {}", *stream_id);
             VideoError::InvalidStreamId(*stream_id)
@@ -329,49 +338,11 @@ impl ContextMap {
     }
 }
 
-/// A thin wrapper of a map of decoder sessions with error handlings.
-struct SessionMap<S: DecoderSession> {
-    map: BTreeMap<u32, S>,
-}
-
-impl<S: DecoderSession> Default for SessionMap<S> {
-    fn default() -> Self {
-        Self {
-            map: Default::default(),
-        }
-    }
-}
-
-impl<S: DecoderSession> SessionMap<S> {
-    fn contains_key(&self, stream_id: StreamId) -> bool {
-        self.map.contains_key(&stream_id)
-    }
-
-    fn get(&self, stream_id: &StreamId) -> VideoResult<&S> {
-        self.map.get(&stream_id).ok_or_else(|| {
-            error!("failed to get decoder session {}", *stream_id);
-            VideoError::InvalidStreamId(*stream_id)
-        })
-    }
-
-    fn get_mut(&mut self, stream_id: &StreamId) -> VideoResult<&mut S> {
-        self.map.get_mut(&stream_id).ok_or_else(|| {
-            error!("failed to get decoder session {}", *stream_id);
-            VideoError::InvalidStreamId(*stream_id)
-        })
-    }
-
-    fn insert(&mut self, stream_id: StreamId, session: S) -> Option<S> {
-        self.map.insert(stream_id, session)
-    }
-}
-
 /// Represents information of a decoder backed by a `DecoderBackend`.
 pub struct Decoder<D: DecoderBackend> {
     decoder: D,
     capability: Capability,
-    contexts: ContextMap,
-    sessions: SessionMap<D::Session>,
+    contexts: ContextMap<D::Session>,
 }
 
 impl<'a, D: DecoderBackend> Decoder<D> {
@@ -400,17 +371,12 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         if self.contexts.map.remove(&stream_id).is_none() {
             error!("Tried to destroy an invalid stream context {}", stream_id);
         }
-
-        // Close a decoder session, as closing will be done in `Drop` for `session`.
-        // Note that `sessions` doesn't have an instance for `stream_id` if the
-        // first `ResourceCreate` haven't been called yet.
-        self.sessions.map.remove(&stream_id);
     }
 
     fn create_session(
         decoder: &D,
         poll_ctx: &PollContext<Token>,
-        ctx: &Context,
+        ctx: &Context<D::Session>,
         stream_id: StreamId,
     ) -> VideoResult<D::Session> {
         let format = match ctx.in_params.format {
@@ -448,9 +414,13 @@ impl<'a, D: DecoderBackend> Decoder<D> {
 
         // Create a instance of `DecoderSession` at the first time `ResourceCreate` is
         // called here.
-        if !self.sessions.contains_key(stream_id) {
-            let session = Self::create_session(&self.decoder, poll_ctx, ctx, stream_id)?;
-            self.sessions.insert(stream_id, session);
+        if ctx.session.is_none() {
+            ctx.session = Some(Self::create_session(
+                &self.decoder,
+                poll_ctx,
+                ctx,
+                stream_id,
+            )?);
         }
 
         ctx.register_buffer(queue_type, resource_id, &uuid);
@@ -502,8 +472,8 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         timestamp: u64,
         data_sizes: Vec<u32>,
     ) -> VideoResult<()> {
-        let session = self.sessions.get(&stream_id)?;
         let ctx = self.contexts.get_mut(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         if data_sizes.len() != 1 {
             error!("num_data_sizes must be 1 but {}", data_sizes.len());
@@ -550,8 +520,8 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         stream_id: StreamId,
         resource_id: ResourceId,
     ) -> VideoResult<()> {
-        let session = self.sessions.get(&stream_id)?;
         let ctx = self.contexts.get_mut(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         // Check if the current pixel format is set to NV12.
         match ctx.out_params.format {
@@ -625,7 +595,7 @@ impl<'a, D: DecoderBackend> Decoder<D> {
         let ctx = self.contexts.get_mut(&stream_id)?;
         match queue_type {
             QueueType::Input => {
-                if self.sessions.contains_key(stream_id) {
+                if ctx.session.is_some() {
                     error!("parameter for input cannot be changed once decoding started");
                     return Err(VideoError::InvalidParameter);
                 }
@@ -691,12 +661,17 @@ impl<'a, D: DecoderBackend> Decoder<D> {
     }
 
     fn drain_stream(&mut self, stream_id: StreamId) -> VideoResult<()> {
-        self.sessions.get(&stream_id)?.flush()
+        self.contexts
+            .get(&stream_id)?
+            .session
+            .as_ref()
+            .ok_or(VideoError::InvalidOperation)?
+            .flush()
     }
 
     fn clear_queue(&mut self, stream_id: StreamId, queue_type: QueueType) -> VideoResult<()> {
         let ctx = self.contexts.get_mut(&stream_id)?;
-        let session = self.sessions.get(&stream_id)?;
+        let session = ctx.session.as_ref().ok_or(VideoError::InvalidOperation)?;
 
         // TODO(b/153406792): Though QUEUE_CLEAR is defined as a per-queue command in the
         // specification, the VDA's `Reset()` clears the input buffers and may (or may not) drop
@@ -848,13 +823,18 @@ impl<D: DecoderBackend> Device for Decoder<D> {
 
         use crate::virtio::video::device::VideoEvtResponseType::*;
 
-        let session = match self.sessions.get_mut(&stream_id) {
-            Ok(s) => s,
+        let ctx = match self.contexts.get_mut(&stream_id) {
+            Ok(ctx) => ctx,
             Err(e) => {
-                error!(
-                    "an event notified for an unknown session {}: {}",
-                    stream_id, e
-                );
+                error!("failed to get a context for session {}: {}", stream_id, e);
+                return None;
+            }
+        };
+
+        let session = match ctx.session.as_mut() {
+            Some(s) => s,
+            None => {
+                error!("session not yet created for context {}", stream_id);
                 return None;
             }
         };
@@ -863,17 +843,6 @@ impl<D: DecoderBackend> Device for Decoder<D> {
             Ok(event) => event,
             Err(e) => {
                 error!("failed to read an event from session {}: {}", stream_id, e);
-                return None;
-            }
-        };
-
-        let ctx = match self.contexts.get_mut(&stream_id) {
-            Ok(ctx) => ctx,
-            Err(_) => {
-                error!(
-                    "failed to get a context for session {}: {:?}",
-                    stream_id, event
-                );
                 return None;
             }
         };
@@ -1039,8 +1008,7 @@ impl<'a> Decoder<&'a libvda::decode::VdaInstance> {
         Decoder {
             decoder: vda,
             capability: Capability::new(vda.get_capabilities()),
-            contexts: Default::default(),
-            sessions: Default::default(),
+            contexts: ContextMap::new(),
         }
     }
 }
