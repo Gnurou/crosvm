@@ -77,14 +77,6 @@ struct OutputResources {
     // destroyed.
     eos_resource_id: Option<OutputResourceId>,
 
-    // This is a flag that shows whether the device's set_output_buffer_count is called.
-    // This will be set to true when ResourceCreate for OutputBuffer is called for the first time.
-    //
-    // TODO(b/1518105): This field is added as a hack because the current virtio-video v3 spec
-    // doesn't have a way to send a number of frame buffers the guest provides.
-    // Once we have the way in the virtio-video protocol, we should remove this flag.
-    is_output_buffer_count_set: bool,
-
     // OutputResourceId -> ResourceHandle
     res_id_to_res_handle: BTreeMap<OutputResourceId, ResourceHandle>,
 }
@@ -146,14 +138,6 @@ impl OutputResources {
 
     fn dequeue_eos_resource_id(&mut self) -> Option<OutputResourceId> {
         self.queued_res_ids.take(&self.eos_resource_id?)
-    }
-
-    fn set_output_buffer_count(&mut self) -> bool {
-        if !self.is_output_buffer_count_set {
-            self.is_output_buffer_count_set = true;
-            return true;
-        }
-        false
     }
 }
 
@@ -558,17 +542,6 @@ impl<'a, D: DecoderBackend> Decoder<D> {
                         stride: resource_info.planes[1].stride as i32,
                     },
                 ];
-
-                // Set output_buffer_count before passing the first output buffer.
-                if ctx.out_res.set_output_buffer_count() {
-                    const OUTPUT_BUFFER_COUNT: usize = 32;
-
-                    // Set the buffer count to the maximum value.
-                    // TODO(b/1518105): This is a hack due to the lack of way of telling a number of
-                    // frame buffers explictly in virtio-video v3 RFC. Once we have the way,
-                    // set_output_buffer_count should be called with a value passed by the guest.
-                    session.set_output_buffer_count(OUTPUT_BUFFER_COUNT)?;
-                }
 
                 // Take ownership of this file by `into_raw_fd()` as this
                 // file will be closed by libvda.

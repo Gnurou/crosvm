@@ -3,8 +3,8 @@
 // found in the LICENSE file.
 
 use base::error;
-use std::convert::TryFrom;
 use std::os::unix::io::RawFd;
+use std::{cell::Cell, convert::TryFrom};
 
 use libvda::decode::Event as LibvdaEvent;
 
@@ -119,13 +119,27 @@ impl From<libvda::decode::Event> for DecoderEvent {
 
 pub struct LibvdaSession<'a> {
     session: libvda::decode::Session<'a>,
+
+    // This is a flag that shows whether the device's set_output_buffer_count is called.
+    // This will be set to true when ResourceCreate for OutputBuffer is called for the first time,
+    // and reset to false upon a ProvidePictureBuffers event.
+    //
+    // TODO(b/1518105): This field is added as a hack because the current virtio-video v3 spec
+    // doesn't have a way to send a number of frame buffers the guest provides.
+    // Once we have the way in the virtio-video protocol, we should remove this flag.
+    set_output_buffer_count_called: Cell<bool>,
+}
+
+impl<'a> LibvdaSession<'a> {
+    fn new(session: libvda::decode::Session<'a>) -> Self {
+        LibvdaSession {
+            session,
+            set_output_buffer_count_called: Default::default(),
+        }
+    }
 }
 
 impl<'a> DecoderSession for LibvdaSession<'a> {
-    fn set_output_buffer_count(&self, count: usize) -> VideoResult<()> {
-        Ok(self.session.set_output_buffer_count(count)?)
-    }
-
     fn decode(
         &self,
         bitstream_id: i32,
@@ -155,6 +169,17 @@ impl<'a> DecoderSession for LibvdaSession<'a> {
         output_buffer: RawFd,
         planes: &[FramePlane],
     ) -> VideoResult<()> {
+        if !self.set_output_buffer_count_called.get() {
+            const OUTPUT_BUFFER_COUNT: usize = 32;
+
+            // Set the buffer count to the maximum value.
+            // TODO(b/1518105): This is a hack due to the lack of way of telling a number of
+            // frame buffers explictly in virtio-video v3 RFC. Once we have the way,
+            // set_output_buffer_count should be called with a value passed by the guest.
+            self.session.set_output_buffer_count(OUTPUT_BUFFER_COUNT)?;
+            self.set_output_buffer_count_called.set(true);
+        }
+
         let vda_planes: Vec<libvda::FramePlane> = planes.into_iter().map(Into::into).collect();
         Ok(self.session.use_output_buffer(
             picture_buffer_id,
@@ -169,10 +194,13 @@ impl<'a> DecoderSession for LibvdaSession<'a> {
     }
 
     fn read_event(&mut self) -> VideoResult<DecoderEvent> {
-        self.session
-            .read_event()
-            .map(Into::into)
-            .map_err(Into::into)
+        let event = self.session.read_event();
+
+        if let Ok(LibvdaEvent::ProvidePictureBuffers { .. }) = &event {
+            self.set_output_buffer_count_called.set(false);
+        }
+
+        event.map(Into::into).map_err(Into::into)
     }
 }
 
@@ -186,6 +214,6 @@ impl<'a> DecoderBackend for &'a libvda::decode::VdaInstance {
             VideoError::InvalidOperation
         })?;
 
-        Ok(LibvdaSession { session })
+        Ok(LibvdaSession::new(session))
     }
 }

@@ -21,11 +21,6 @@ pub struct FramePlane {
 
 /// Contains the device's state for one playback session, i.e. one stream.
 pub trait DecoderSession {
-    /// Tell how many output buffers will be used for this session. This method
-    /// Must be called after a `ProvidePictureBuffers` event is emitted, and
-    /// before the first call to `use_output_buffers()`.
-    fn set_output_buffer_count(&self, count: usize) -> VideoResult<()>;
-
     /// Decode the compressed stream contained in [`offset`..`offset`+`bytes_used`]
     /// of the shared memory in `fd`. `bitstream_id` is the identifier for that
     /// part of the stream (most likely, a timestamp).
